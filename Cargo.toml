@@ -1,0 +1,18 @@
+[package]
+name = "monte_carlo_stock_sim"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mc-sim"
+path = "src/main.rs"
+
+[dependencies]
+rand = "0.8"
+rand_distr = "0.4"
+rayon = "=1.10.0"
+clap = { version = "=4.4.18", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
