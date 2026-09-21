@@ -59,6 +59,27 @@ struct Args {
     /// How many sample paths to record when --paths-output is set
     #[arg(long, default_value_t = 100)]
     sample_paths: usize,
+
+    /// Strike price for European option pricing. Setting this switches the
+    /// simulation to the risk-neutral measure (drift = --risk-free-rate)
+    /// so the Monte Carlo price is a valid no-arbitrage price.
+    #[arg(long)]
+    strike: Option<f64>,
+
+    /// Annualized continuously-compounded risk-free rate, used for
+    /// risk-neutral drift and discounting when --strike is set
+    #[arg(long, default_value_t = 0.04)]
+    risk_free_rate: f64,
+
+    /// Option type to price when --strike is set
+    #[arg(long, value_enum, default_value_t = OptionType::Call)]
+    option_type: OptionType,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionType {
+    Call,
+    Put,
 }
 
 struct SimOutcome {
@@ -68,12 +89,13 @@ struct SimOutcome {
 
 fn simulate_one_path(
     args: &Args,
+    mu: f64,
     dt: f64,
     normal: &Normal<f64>,
     rng: &mut StdRng,
     record_path: bool,
 ) -> SimOutcome {
-    let drift_term = (args.drift - 0.5 * args.volatility * args.volatility) * dt;
+    let drift_term = (mu - 0.5 * args.volatility * args.volatility) * dt;
     let vol_term = args.volatility * dt.sqrt();
 
     let mut price = args.initial_price;
@@ -165,6 +187,92 @@ fn compute_stats(final_prices: &[f64], initial_price: f64, confidence: f64) -> S
     }
 }
 
+struct OptionPricingResult {
+    mc_price: f64,
+    std_error: f64,
+    ci_low: f64,
+    ci_high: f64,
+    black_scholes_price: f64,
+}
+
+/// Abramowitz & Stegun 7.1.26 approximation of the error function (max abs
+/// error ~1.5e-7), used to build the standard normal CDF without pulling in
+/// an extra dependency.
+fn erf(x: f64) -> f64 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    const A1: f64 = 0.254829592;
+    const A2: f64 = -0.284496736;
+    const A3: f64 = 1.421413741;
+    const A4: f64 = -1.453152027;
+    const A5: f64 = 1.061405429;
+    const P: f64 = 0.3275911;
+    let t = 1.0 / (1.0 + P * x);
+    let y = 1.0 - (((((A5 * t + A4) * t) + A3) * t + A2) * t + A1) * t * (-x * x).exp();
+    sign * y
+}
+
+fn norm_cdf(x: f64) -> f64 {
+    0.5 * (1.0 + erf(x / std::f64::consts::SQRT_2))
+}
+
+/// Closed-form Black-Scholes price, used to sanity-check the Monte Carlo
+/// estimate for a plain European option.
+fn black_scholes_price(
+    s0: f64,
+    k: f64,
+    r: f64,
+    sigma: f64,
+    t: f64,
+    option_type: OptionType,
+) -> f64 {
+    let d1 = ((s0 / k).ln() + (r + 0.5 * sigma * sigma) * t) / (sigma * t.sqrt());
+    let d2 = d1 - sigma * t.sqrt();
+    match option_type {
+        OptionType::Call => s0 * norm_cdf(d1) - k * (-r * t).exp() * norm_cdf(d2),
+        OptionType::Put => k * (-r * t).exp() * norm_cdf(-d2) - s0 * norm_cdf(-d1),
+    }
+}
+
+/// Prices a European option from simulated final prices via discounted
+/// expected payoff, using paths already simulated under the risk-neutral
+/// measure (drift = risk_free_rate).
+fn price_option(
+    final_prices: &[f64],
+    s0: f64,
+    k: f64,
+    r: f64,
+    sigma: f64,
+    t: f64,
+    option_type: OptionType,
+) -> OptionPricingResult {
+    let discount = (-r * t).exp();
+    let payoffs: Vec<f64> = final_prices
+        .iter()
+        .map(|&s| match option_type {
+            OptionType::Call => (s - k).max(0.0),
+            OptionType::Put => (k - s).max(0.0),
+        })
+        .collect();
+
+    let n = payoffs.len() as f64;
+    let mean_payoff = payoffs.iter().sum::<f64>() / n;
+    let variance = payoffs.iter().map(|p| (p - mean_payoff).powi(2)).sum::<f64>() / n;
+    let payoff_std_dev = variance.sqrt();
+
+    let mc_price = discount * mean_payoff;
+    // Standard error of the discounted mean payoff, via CLT.
+    let std_error = discount * payoff_std_dev / n.sqrt();
+
+    OptionPricingResult {
+        mc_price,
+        std_error,
+        ci_low: mc_price - 1.96 * std_error,
+        ci_high: mc_price + 1.96 * std_error,
+        black_scholes_price: black_scholes_price(s0, k, r, sigma, t, option_type),
+    }
+}
+
 fn write_final_prices_csv(path: &str, final_prices: &[f64]) -> std::io::Result<()> {
     let file = File::create(path)?;
     let mut w = BufWriter::new(file);
@@ -209,13 +317,19 @@ fn main() {
         .map(|i| args.paths_output.is_some() && i < args.sample_paths)
         .collect();
 
+    // Pricing an option requires the risk-neutral measure: drift = r, not
+    // the real-world expected return. Otherwise the discounted expected
+    // payoff isn't a valid no-arbitrage price.
+    let pricing = args.strike.is_some();
+    let mu = if pricing { args.risk_free_rate } else { args.drift };
+
     let start = std::time::Instant::now();
 
     let outcomes: Vec<SimOutcome> = (0..args.simulations)
         .into_par_iter()
         .map(|i| {
             let mut rng = StdRng::seed_from_u64(base_seed.wrapping_add(i as u64));
-            simulate_one_path(&args, dt, &normal, &mut rng, record_flags[i])
+            simulate_one_path(&args, mu, dt, &normal, &mut rng, record_flags[i])
         })
         .collect();
 
@@ -227,11 +341,20 @@ fn main() {
     println!("Monte Carlo Stock Simulation (Geometric Brownian Motion)");
     println!("----------------------------------------------------------");
     println!("Initial price:      {:.2}", args.initial_price);
-    println!(
-        "Drift / Volatility:  {:.2}% / {:.2}% (annualized)",
-        args.drift * 100.0,
-        args.volatility * 100.0
-    );
+    if pricing {
+        println!(
+            "Drift:               {:.2}% (risk-neutral, = risk-free rate; real-world drift {:.2}% ignored for pricing)",
+            mu * 100.0,
+            args.drift * 100.0
+        );
+        println!("Volatility:          {:.2}%", args.volatility * 100.0);
+    } else {
+        println!(
+            "Drift / Volatility:  {:.2}% / {:.2}% (annualized)",
+            args.drift * 100.0,
+            args.volatility * 100.0
+        );
+    }
     println!(
         "Horizon:             {} trading days (~{:.2} years)",
         args.days,
@@ -261,6 +384,37 @@ fn main() {
         args.confidence * 100.0,
         stats.cvar * 100.0
     );
+
+    if let Some(k) = args.strike {
+        let t = args.days as f64 / TRADING_DAYS_PER_YEAR;
+        let result = price_option(
+            &final_prices,
+            args.initial_price,
+            k,
+            args.risk_free_rate,
+            args.volatility,
+            t,
+            args.option_type,
+        );
+        let diff = result.mc_price - result.black_scholes_price;
+
+        println!();
+        println!("European {:?} option pricing", args.option_type);
+        println!("----------------------------------------------------------");
+        println!("Strike:              {:.2}", k);
+        println!("Risk-free rate:      {:.2}%", args.risk_free_rate * 100.0);
+        println!("Time to expiry:      {:.4} years", t);
+        println!(
+            "Monte Carlo price:   {:.4}  (95% CI: {:.4} - {:.4}, SE: {:.4})",
+            result.mc_price, result.ci_low, result.ci_high, result.std_error
+        );
+        println!("Black-Scholes price: {:.4}", result.black_scholes_price);
+        println!(
+            "MC - BS difference:  {:.4}  ({:.3}% of BS price)",
+            diff,
+            100.0 * diff / result.black_scholes_price
+        );
+    }
 
     if let Some(out_path) = &args.output {
         match write_final_prices_csv(out_path, &final_prices) {
